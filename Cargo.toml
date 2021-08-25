@@ -1,0 +1,17 @@
+[package]
+name = "defmt-uart"
+version = "0.1.0"
+edition = "2018"
+authors = ["Javier Alvarez <javier.alvarez@allthingsembedded.net>"]
+
+[dependencies]
+structopt = "0.3"
+thiserror = "1.0"
+ctrlc = "3.1.7"
+log = "0.4.14"
+serialport = "4.0"
+anyhow = "1.0.43"
+
+[dependencies.defmt-decoder]
+version = "0.2.2"
+features = ["unstable"]
