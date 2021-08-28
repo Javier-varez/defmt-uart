@@ -54,9 +54,9 @@ struct Opts {
     #[structopt(long, parse(try_from_str=try_to_serial_parity))]
     parity: Option<Parity>,
 
-    /// Disables FW version check.
+    /// Shows defmt parsing errors. By default these are ignored.
     #[structopt(long, short = "d")]
-    disable_version_check: bool,
+    display_parsing_errors: bool,
 
     /// Lists the available serial ports and exits.
     #[structopt(long)]
@@ -139,7 +139,9 @@ fn main() -> anyhow::Result<()> {
                 }
                 Err(defmt_decoder::DecodeError::UnexpectedEof) => break,
                 Err(defmt_decoder::DecodeError::Malformed) => {
-                    log::error!("failed to decode defmt data: {:x?}", frames);
+                    if opts.display_parsing_errors {
+                        log::error!("failed to decode defmt data: {:x?}", frames);
+                    }
                     // Remove one byte and try again
                     frames.rotate_left(1);
                     frames.truncate(frames.len() - 1);
