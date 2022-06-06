@@ -1,5 +1,8 @@
 use defmt_decoder::Table;
+use defmt_decoder::{DecodeError, Frame, Locations, StreamDecoder};
 use serialport::{self, FlowControl, Parity, StopBits};
+use std::env;
+use std::path::Path;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -77,16 +80,11 @@ fn main() -> anyhow::Result<()> {
     let verbose = false;
     defmt_decoder::log::init_logger(verbose, |_| true);
 
-    let elf_data = std::fs::read(&opts.elf.unwrap())?;
-    let table = Table::parse(&elf_data)?.ok_or(SerialError::DefmtDataNotFound)?;
-    let locs = table.get_locations(&elf_data)?;
+    let current_dir = &env::current_dir()?;
 
-    let locs = if table.indices().all(|idx| locs.contains_key(&(idx as u64))) {
-        Some(locs)
-    } else {
-        log::warn!("(BUG) location info is incomplete; it will be omitted from the output");
-        None
-    };
+    let elf_data = std::fs::read(&opts.elf.unwrap())?;
+    let (table, locations) = extract_defmt_info(&elf_data)?;
+    let table = table.unwrap();
 
     let mut port = serialport::new(opts.port.unwrap(), opts.baudrate.unwrap_or(115200u32))
         .parity(opts.parity.unwrap_or(Parity::None))
@@ -95,58 +93,108 @@ fn main() -> anyhow::Result<()> {
         .open()?;
     port.set_timeout(std::time::Duration::from_millis(100))?;
 
-    let mut buffer = [0; 1024];
-    let mut frames = vec![];
+    let mut decoder_and_encoding = (table.new_stream_decoder(), table.encoding());
+
+    let mut read_buf = [0; 1024];
     loop {
-        let count = match port.read(&mut buffer[..]) {
+        let num_bytes_read = match port.read(&mut read_buf) {
             Ok(count) => Ok(count),
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Ok(0),
             Err(error) => Err(error),
         }?;
 
-        if count == 0 {
-            continue;
-        }
+        if num_bytes_read != 0 {
+            let (stream_decoder, encoding) = &mut decoder_and_encoding;
+            stream_decoder.received(&read_buf[..num_bytes_read]);
 
-        frames.extend_from_slice(&buffer[..count]);
-
-        loop {
-            match table.decode(&frames) {
-                Ok((frame, consumed)) => {
-                    // NOTE(`[]` indexing) all indices in `table` have already been
-                    // verified to exist in the `locs` map
-                    let loc = locs.as_ref().map(|locs| &locs[&frame.index()]);
-
-                    let (mut file, mut line, mut mod_path) = (None, None, None);
-                    if let Some(loc) = loc {
-                        let relpath = &loc.file;
-                        file = Some(relpath.display().to_string());
-                        line = Some(loc.line as u32);
-                        mod_path = Some(loc.module.clone());
-                    }
-
-                    // Forward the defmt frame to our logger.
-                    defmt_decoder::log::log_defmt(
-                        &frame,
-                        file.as_deref(),
-                        line,
-                        mod_path.as_deref(),
-                    );
-
-                    let num_frames = frames.len();
-                    frames.rotate_left(consumed);
-                    frames.truncate(num_frames - consumed);
-                }
-                Err(defmt_decoder::DecodeError::UnexpectedEof) => break,
-                Err(defmt_decoder::DecodeError::Malformed) => {
+            match decode_and_print_defmt_logs(
+                &mut **stream_decoder,
+                locations.as_ref(),
+                current_dir,
+                encoding.can_recover(),
+            ) {
+                Ok(_) => {}
+                Err(error) => {
                     if opts.display_parsing_errors {
-                        log::error!("failed to decode defmt data: {:x?}", frames);
+                        log::error!("Error parsing uart data: {}", error);
                     }
-                    // Remove one byte and try again
-                    frames.rotate_left(1);
-                    frames.truncate(frames.len() - 1);
                 }
             }
         }
     }
+}
+
+fn extract_defmt_info(elf_bytes: &[u8]) -> anyhow::Result<(Option<Table>, Option<Locations>)> {
+    let defmt_table = match env::var("PROBE_RUN_IGNORE_VERSION").as_deref() {
+        Ok("true") | Ok("1") => defmt_decoder::Table::parse_ignore_version(elf_bytes)?,
+        _ => defmt_decoder::Table::parse(elf_bytes)?,
+    };
+
+    let mut defmt_locations = None;
+
+    if let Some(table) = defmt_table.as_ref() {
+        let locations = table.get_locations(elf_bytes)?;
+
+        if !table.is_empty() && locations.is_empty() {
+            log::warn!("insufficient DWARF info; compile your program with `debug = 2` to enable location info");
+        } else if table
+            .indices()
+            .all(|idx| locations.contains_key(&(idx as u64)))
+        {
+            defmt_locations = Some(locations);
+        } else {
+            log::warn!("(BUG) location info is incomplete; it will be omitted from the output");
+        }
+    }
+
+    Ok((defmt_table, defmt_locations))
+}
+
+fn decode_and_print_defmt_logs(
+    stream_decoder: &mut dyn StreamDecoder,
+    locations: Option<&Locations>,
+    current_dir: &Path,
+    encoding_can_recover: bool,
+) -> anyhow::Result<()> {
+    loop {
+        match stream_decoder.decode() {
+            Ok(frame) => forward_to_logger(&frame, locations, current_dir),
+            Err(DecodeError::UnexpectedEof) => break,
+            Err(DecodeError::Malformed) => match encoding_can_recover {
+                // if recovery is impossible, abort
+                false => return Err(DecodeError::Malformed.into()),
+                // if recovery is possible, skip the current frame and continue with new data
+                true => continue,
+            },
+        }
+    }
+
+    Ok(())
+}
+
+fn forward_to_logger(frame: &Frame, locations: Option<&Locations>, current_dir: &Path) {
+    let (file, line, mod_path) = location_info(frame, locations, current_dir);
+    defmt_decoder::log::log_defmt(frame, file.as_deref(), line, mod_path.as_deref());
+}
+
+fn location_info(
+    frame: &Frame,
+    locations: Option<&Locations>,
+    current_dir: &Path,
+) -> (Option<String>, Option<u32>, Option<String>) {
+    locations
+        .map(|locations| &locations[&frame.index()])
+        .map(|location| {
+            let path = if let Ok(relpath) = location.file.strip_prefix(&current_dir) {
+                relpath.display().to_string()
+            } else {
+                location.file.display().to_string()
+            };
+            (
+                Some(path),
+                Some(location.line as u32),
+                Some(location.module.clone()),
+            )
+        })
+        .unwrap_or((None, None, None))
 }

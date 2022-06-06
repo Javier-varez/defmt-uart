@@ -13,5 +13,5 @@ serialport = "4.0"
 anyhow = "1.0.43"
 
 [dependencies.defmt-decoder]
-version = "0.2.2"
+version = "=0.3.0"
 features = ["unstable"]
